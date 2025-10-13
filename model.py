@@ -30,11 +30,11 @@ class Config:
     MODEL_NAME = 'efficientnet_b3'
     NUM_CLASSES = 7
     FREEZE_LAYERS = True
-    UNFREEZE_LAST_N = 1  # Unfreeze last blocks
+    UNFREEZE_LAST_N = 4  # Unfreeze last blocks
     
     # Training
     BATCH_SIZE = 32
-    EPOCHS = 2
+    EPOCHS = 70
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
     
