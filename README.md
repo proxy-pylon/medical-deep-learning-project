@@ -20,3 +20,12 @@ Making the project better
 1) Visualize what the model “sees” - heatmaps on lesions, for instance. Professors love that. It turns an average model into an “AI-assisted diagnosis” story.
 2) Make a web or some UI to make it look better
 3) Try different configurations. Like another model, different number of frozen layers, different number of epochs, different dropout, etc
+
+
+Building the model (hardest part)
+1) Forget about metadata, classify images only
+2) Build a data pipeline (transforms, dataset, dataloader)
+3) build a model with resnet 50
+4) add metadata info
+5) make models easily switchable. For example can test in one line of code with resnet 50, efficient net, resnet 16
+6) go to "making the project better"
