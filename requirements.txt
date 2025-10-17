@@ -1,34 +1,20 @@
-# Core scientific stack
 numpy
 pandas
-scikit-learn
-
-# PyTorch (CPU by default via pip; install a CUDA build separately if needed)
 torch
 torchvision
-
-# TensorFlow and Keras
-tensorflow
-keras
-keras-tuner
-
-
-# Imaging & plots
-pillow
+Pillow
+opencv-python
+tqdm
 matplotlib
 seaborn
-timm
-
-# Optional: faster wheels and common deps get pulled automatically by the above
-# typing-extensions
-# tqdm
-# scipy
-# joblib
+scikit-learn
+albumentations
 
 # Windows setup:
 # in cmd: python -m venv .venv
 # Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 # ".\.venv\Scripts\Activate.ps1"
+# "source .venv/bin/activate"  # for Linux/Mac
 # pip install -r requirements.txt
 
 # Checking installed packages

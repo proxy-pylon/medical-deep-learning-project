@@ -1,360 +1,198 @@
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import timm
 import pandas as pd
 import numpy as np
 from PIL import Image
-import os
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, roc_auc_score, classification_report, confusion_matrix
+import cv2
+from pathlib import Path
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-from collections import Counter
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, precision_score, 
+    recall_score, f1_score, confusion_matrix, roc_curve, auc
+)
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import torchvision.models as models
+from torchvision.models import ResNet50_Weights, EfficientNet_B0_Weights
+
+import torch
+import cv2
+from torch.utils.data import Dataset
+import torch
+from tqdm import tqdm
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set random seeds for reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
-
-# Configuration
 class Config:
-    # Paths
-    DATA_DIR = './data'
-    IMAGE_DIR = os.path.join(DATA_DIR, 'HAM10000_images')
-    METADATA_PATH = os.path.join(DATA_DIR, 'HAM10000_metadata.csv')
-    
-    # Model
-    MODEL_NAME = 'efficientnet_b3'
-    NUM_CLASSES = 7
-    FREEZE_LAYERS = True
-    UNFREEZE_LAST_N = 4  # Unfreeze last blocks
-    
-    # Training
+    # Data Paths
+    HAM10000_BASE = './data'
+    ISIC_BASE =  'not defined lol'
+    # Output Paths
+    OUTPUT_DIR = './output/'
+    CHECKPOINT_DIR = OUTPUT_DIR + 'checkpoints'
+    RESULTS_DIR = OUTPUT_DIR + 'results'
+
+    # Model configurations
+    MODEL_NAME = 'resnet50' # Options: 'resnet50', 'efficientnet', 'vgg16'
+    IMG_SIZE = 224
+    NUM_CLASSES = 2 # Binary: melanoma vs benign
+    PRETRAINED = True
+
+    # Training configurations
     BATCH_SIZE = 32
-    EPOCHS = 30
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-5
-    
-    # Data
-    IMG_SIZE = 300
-    TEST_SIZE = 0.2
-    VAL_SIZE = 0.1  # From training set
-    
+    NUM_EPOCHS = 250
+    LEARNING_RATE = 0.001
+    WEIGHT_DECAY = 1e-4
+    EARLY_STOPPING_PATIENCE = 30
+
+    #Dataset split ratio and seeding
+    TEST_SIZE = 0.30
+    VAL_SIZE = 0.20
+    RANDOM_STATE = 42
+
+    # Augmentation
+    USE_MIXUP = False
+    USE_CUTMIX = False
+
     # Device
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Save paths
-    MODEL_SAVE_PATH = 'best_model.pth'
-    HISTORY_SAVE_PATH = 'training_history.png'
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    NUM_WORKERS = 2
+      
+def load_ham10000_data(base_path):
+    """Loading HAM10000 dataset"""
+    print('Loading HAM10000 dataset....')
 
-config = Config()
-
-# Disease mapping
-DX_MAPPING = {
-    'akiec': 0,  # Actinic keratoses
-    'bcc': 1,    # Basal cell carcinoma
-    'bkl': 2,    # Benign keratosis
-    'df': 3,     # Dermatofibroma
-    'mel': 4,    # Melanoma
-    'nv': 5,     # Melanocytic nevi
-    'vasc': 6    # Vascular lesions
-}
-
-DX_NAMES = list(DX_MAPPING.keys())
-
-
-def load_and_preprocess_metadata(metadata_path):
-    """Load metadata and prepare for patient-based splitting"""
+    # Load metadata
+    metadata_path = os.path.join(base_path, 'HAM10000_metadata.csv')
     df = pd.read_csv(metadata_path)
-    
-    # Map diagnoses to numeric labels
-    df['label'] = df['dx'].map(DX_MAPPING)
-    
-    # Get unique patient IDs (lesion_id represents unique patients/lesions)
-    df['patient_id'] = df['lesion_id']
-    
-    print(f"Total images: {len(df)}")
-    print(f"Unique patients: {df['patient_id'].nunique()}")
-    print(f"\nClass distribution:\n{df['dx'].value_counts()}")
-    
+
+    # Create image paths
+    def get_image_path(image_id):
+        # Check for image directories
+        part1 = os.path.join(base_path, 'HAM10000_images_part_1', f'{image_id}.jpg')
+        part2 = os.path.join(base_path, 'HAM10000_images_part_2', f'{image_id}.jpg')
+
+        if os.path.exists(part1):
+            return part1
+        elif os.path.exists(part2):
+            return part2
+        else: 
+            return None
+            
+    # Getting image path
+    df['image_path'] = df['image_id'].apply(get_image_path)
+
+    # Remove missing images
+    df = df[df['image_path'].notna()].reset_index(drop=True)
+
+    # Binary classification: melanoma (mel) vs others
+    df['binary_label'] = (df['dx'] == 'mel').astype(int)
+
+    print(f"Loaded {len(df)} images")
+    print(f"Melanoma: {df['binary_label'].sum()}")
+    print(f"Benign: {len(df) - df['binary_label'].sum()}")
+    print(f"\nClass Distribution:")
+    print(df['dx'].value_counts())
+
     return df
 
+class MelanomaDataset(Dataset):
+    """Custom dataset for melanoma classification"""
 
-def patient_based_split(df, test_size=0.2, val_size=0.1, random_state=42):
-    """
-    Split by patient ID to prevent data leakage.
-    Stratify by diagnosis to maintain class balance.
-    """
-    # Get one row per patient with their diagnosis
-    patient_df = df.groupby('patient_id').agg({
-        'dx': 'first',
-        'label': 'first'
-    }).reset_index()
-    
-    # First split: train+val vs test (stratified by diagnosis)
-    train_val_patients, test_patients = train_test_split(
-        patient_df['patient_id'].values,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=patient_df['label'].values
-    )
-    
-    # Get labels for train_val_patients for stratification
-    train_val_labels = patient_df[patient_df['patient_id'].isin(train_val_patients)]['label'].values
-    
-    # Second split: train vs val (stratified)
-    val_size_adjusted = val_size / (1 - test_size)
-    train_patients, val_patients = train_test_split(
-        train_val_patients,
-        test_size=val_size_adjusted,
-        random_state=random_state,
-        stratify=train_val_labels
-    )
-    
-    # Create splits
-    train_df = df[df['patient_id'].isin(train_patients)].copy()
-    val_df = df[df['patient_id'].isin(val_patients)].copy()
-    test_df = df[df['patient_id'].isin(test_patients)].copy()
-    
-    print(f"\nSplit statistics:")
-    print(f"Train: {len(train_df)} images, {len(train_patients)} patients")
-    print(f"Val: {len(val_df)} images, {len(val_patients)} patients")
-    print(f"Test: {len(test_df)} images, {len(test_patients)} patients")
-    
-    return train_df, val_df, test_df
-
-
-def fill_missing_values(train_df, val_df, test_df):
-    """
-    Fill missing values using only training set statistics.
-    This prevents data leakage.
-    """
-    # Calculate statistics from training set only
-    age_median = train_df['age'].median()
-    sex_mode = train_df['sex'].mode()[0]
-    localization_mode = train_df['localization'].mode()[0]
-    
-    # Fill missing values in all sets using training statistics
-    for df in [train_df, val_df, test_df]:
-        df['age'].fillna(age_median, inplace=True)
-        df['sex'].fillna(sex_mode, inplace=True)
-        df['localization'].fillna(localization_mode, inplace=True)
-    
-    print(f"\nFilled missing values using training set statistics:")
-    print(f"Age median: {age_median}")
-    print(f"Sex mode: {sex_mode}")
-    print(f"Localization mode: {localization_mode}")
-    
-    return train_df, val_df, test_df
-
-
-def normalize_age(age):
-    """
-    Smart age normalization using robust scaling.
-    Assumes age range 0-100 but uses percentile-based normalization.
-    """
-    # Clip outliers
-    age = np.clip(age, 0, 100)
-    # Normalize using expected range with slight compression at extremes
-    return (age - 50) / 40  # Centers around 50, ~95% of data in [-1, 1]
-
-
-def encode_categorical_features(train_df, val_df, test_df):
-    """Encode categorical features"""
-    # Sex encoding
-    sex_map = {'male': 0, 'female': 1, 'unknown': 2}
-    
-    # Localization encoding - get from training set
-    unique_locs = train_df['localization'].unique()
-    loc_map = {loc: idx for idx, loc in enumerate(unique_locs)}
-    
-    for df in [train_df, val_df, test_df]:
-        df['sex_encoded'] = df['sex'].map(sex_map).fillna(2)
-        df['localization_encoded'] = df['localization'].map(loc_map).fillna(0)
-        df['age_normalized'] = df['age'].apply(normalize_age)
-    
-    return train_df, val_df, test_df, len(loc_map)
-
-
-class HAM10000Dataset(Dataset):
-    """Dataset with metadata features and heavy augmentation"""
-    
-    def __init__(self, df, image_dir, transform=None, use_metadata=True):
-        self.df = df.reset_index(drop=True)
-        self.image_dir = image_dir
+    def __init__(self, dataframe, transform=None):
+        self.df = dataframe.reset_index(drop=True)
         self.transform = transform
-        self.use_metadata = use_metadata
-    
+
     def __len__(self):
         return len(self.df)
-    
+
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        
+        img_path = self.df.loc[idx, 'image_path']
+        label = self.df.loc[idx, 'binary_label']
+
         # Load image
-        img_name = f"{row['image_id']}.jpg"
-        img_path = os.path.join(self.image_dir, img_name)
-        
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except:
-            # Fallback: create a blank image if file not found
-            image = Image.new('RGB', (config.IMG_SIZE, config.IMG_SIZE), color='gray')
-        
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Apply transforms
         if self.transform:
-            image = self.transform(image)
-        
-        label = row['label']
-        
-        if self.use_metadata:
-            # Include metadata features
-            metadata = torch.tensor([
-                row['age_normalized'],
-                row['sex_encoded'],
-                row['localization_encoded']
-            ], dtype=torch.float32)
-            
-            return image, metadata, label
-        else:
-            return image, label
+            augmented = self.transform(image=image)
+            image = augmented['image']
 
+        return {
+            'image': image,
+            'label': torch.tensor(label, dtype=torch.long)  # ✅ fixed typo
+        }
 
-def get_transforms(is_training=True):
-    """
-    Heavy augmentation for training, minimal for validation/test.
-    """
-    if is_training:
-        return transforms.Compose([
-            transforms.Resize((config.IMG_SIZE + 20, config.IMG_SIZE + 20)),
-            transforms.RandomCrop(config.IMG_SIZE),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(20),
-            transforms.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.1
-            ),
-            transforms.RandomAffine(
-                degrees=0,
-                translate=(0.1, 0.1),
-                scale=(0.9, 1.1),
-                shear=10
-            ),
-            transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-            transforms.RandomErasing(p=0.3, scale=(0.02, 0.15))
-        ])
-    else:
-        return transforms.Compose([
-            transforms.Resize((config.IMG_SIZE, config.IMG_SIZE)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+def get_train_transform(img_size=224):
+    """Augmenting images"""
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=45, p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),  # FIXED: val_shift_limit
+        A.OneOf([
+            A.GaussNoise(var_limit=(10.0, 50.0)),
+            A.GaussianBlur(blur_limit=(3, 7)),
+            A.MedianBlur(blur_limit=5),
+        ], p=0.3),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
 
+def get_val_transform(img_size=224):
+    """Validation/test augmentation pipeline"""
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), 
+        ToTensorV2()
+    ])
 
-class EfficientNetClassifier(nn.Module):
-    """
-    EfficientNet with metadata integration and custom classifier.
-    """
-    
-    def __init__(self, model_name, num_classes, num_metadata_features, pretrained=True):
-        super().__init__()
-        
-        # Load pretrained EfficientNet
-        self.backbone = timm.create_model(model_name, pretrained=pretrained)
-        
-        # Get number of features from backbone
-        num_features = self.backbone.classifier.in_features
-        
-        # Remove original classifier
-        self.backbone.classifier = nn.Identity()
-        
-        # Custom classifier with metadata integration
+class MelanomaClassifier(nn.Module):
+    """CNN classifier with transfer learning"""
+    def __init__(self, model_name='resnet50', num_classes=2, pretrained=True):
+        super(MelanomaClassifier, self).__init__()
+        if model_name == 'resnet50':
+            if pretrained:
+                self.backbone = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+            else:
+                self.backbone = models.resnet50(weights=None)
+            num_features = self.backbone.fc.in_features
+            self.backbone.fc = nn.Identity()
+        elif model_name == 'efficientnet':
+            if pretrained:
+                self.backbone = models.efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+            else:
+                self.backbone = models.efficientnet_b0(weights=None)
+            num_features = self.backbone.classifier[1].in_features
+            self.backbone.classifier = nn.Identity()
+        #classification head
         self.classifier = nn.Sequential(
-            nn.Linear(num_features + num_metadata_features, 512),
+            nn.Dropout(0.5),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
             nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
+            nn.Linear(512, num_classes)
         )
-    
-    def forward(self, image, metadata):
-        # Extract image features
-        img_features = self.backbone(image)
-        
-        # Concatenate with metadata
-        combined = torch.cat([img_features, metadata], dim=1)
-        
-        # Classify
-        output = self.classifier(combined)
-        
-        return output
-    
-    def freeze_backbone(self, unfreeze_last_n=4):
-        """
-        Freeze all layers except the last N blocks.
-        For EfficientNet, we unfreeze the last few blocks.
-        """
-        # Freeze all parameters first
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        
-        # Unfreeze last N blocks
-        # EfficientNet structure: blocks[0-6], conv_head, bn2
-        if hasattr(self.backbone, 'blocks'):
-            num_blocks = len(self.backbone.blocks)
-            unfreeze_from = max(0, num_blocks - unfreeze_last_n)
-            
-            for i in range(unfreeze_from, num_blocks):
-                for param in self.backbone.blocks[i].parameters():
-                    param.requires_grad = True
-        
-        # Always unfreeze the head
-        if hasattr(self.backbone, 'conv_head'):
-            for param in self.backbone.conv_head.parameters():
-                param.requires_grad = True
-        if hasattr(self.backbone, 'bn2'):
-            for param in self.backbone.bn2.parameters():
-                param.requires_grad = True
-        
-        # Classifier is always trainable
-        for param in self.classifier.parameters():
-            param.requires_grad = True
-        
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.parameters())
-        print(f"\nTrainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
-
-
-def calculate_class_weights(train_df):
-    """Calculate class weights for imbalanced dataset"""
-    class_counts = train_df['label'].value_counts().sort_index()
-    total = len(train_df)
-    
-    # Inverse frequency weighting
-    weights = torch.tensor([total / (len(class_counts) * count) 
-                           for count in class_counts], 
-                          dtype=torch.float32)
-    
-    print(f"\nClass weights: {weights.numpy()}")
-    return weights
-
+    def forward(self, x):
+        features = self.backbone(x)
+        output = self.classifier(features)
+        return output, features
 
 def train_epoch(model, loader, criterion, optimizer, device):
     """Train for one epoch"""
@@ -363,348 +201,338 @@ def train_epoch(model, loader, criterion, optimizer, device):
     correct = 0
     total = 0
     
-    for images, metadata, labels in loader:
-        images = images.to(device)
-        metadata = metadata.to(device)
-        labels = labels.to(device)
-        
+    pbar = tqdm(loader, desc='Training')
+
+    for batch in pbar:
+        images = batch['image'].to(device)
+        labels = batch['label'].to(device)
+
         optimizer.zero_grad()
-        outputs = model(images, metadata)
+        outputs, _ = model(images)
         loss = criterion(outputs, labels)
-        
         loss.backward()
         optimizer.step()
-        
-        running_loss += loss.item() * images.size(0)
-        _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-    
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
-    
-    return epoch_loss, epoch_acc
 
+        running_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+        pbar.set_postfix({
+            'loss': running_loss / total,
+            'acc': 100 * correct / total
+        })
+    
+    # FIXED: Return statement moved outside the loop
+    return running_loss / total, correct / total
 
 def validate(model, loader, criterion, device):
-    """Validate the model"""
+    """
+    Validate the model on the given data loader.
+
+    Args:
+        model: The neural network model.
+        loader: DataLoader for the validation dataset.
+        criterion: Loss function.
+        device: Device to run the model on (e.g., 'cuda' or 'cpu').
+
+    Returns:
+        Tuple containing average loss and accuracy.
+    """
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc='Validation'):
+            images = batch['image'].to(device)
+            labels = batch['label'].to(device)
+
+            outputs, _ = model(images)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * images.size(0)
+
+            # Fix: correctly unpack the max output
+            _, predicted = outputs.max(1)
+
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+    avg_loss = running_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy
+
+def evaluate_model(model, loader, device):
+    """Testing"""
+    model.eval()
     all_preds = []
     all_labels = []
     all_probs = []
-    
+
     with torch.no_grad():
-        for images, metadata, labels in loader:
-            images = images.to(device)
-            metadata = metadata.to(device)
-            labels = labels.to(device)
-            
-            outputs = model(images, metadata)
-            loss = criterion(outputs, labels)
-            
-            running_loss += loss.item() * images.size(0)
-            
+        for batch in tqdm(loader, desc='Evaluating'):
+            images = batch['image'].to(device)
+            labels = batch['label'].to(device)
+
+            outputs, _ = model(images)
             probs = torch.softmax(outputs, dim=1)
-            _, predicted = torch.max(outputs, 1)
-            
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            all_preds.extend(predicted.cpu().numpy())
+            _, preds = outputs.max(1)
+
+            all_preds.extend(preds.cpu().numpy())  # FIXED: .cpu() not .cput()
             all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
     
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
-    
-    return epoch_loss, epoch_acc, all_preds, all_labels, all_probs
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    roc_auc = roc_auc_score(all_labels, all_probs)
+    cm = confusion_matrix(all_labels, all_preds)
 
-
-def calculate_metrics(y_true, y_pred, y_probs):
-    """Calculate comprehensive metrics"""
-    # Per-class F1 scores
-    f1_per_class = f1_score(y_true, y_pred, average=None)
-    f1_macro = f1_score(y_true, y_pred, average='macro')
-    f1_weighted = f1_score(y_true, y_pred, average='weighted')
-    
-    # ROC-AUC (one-vs-rest)
-    try:
-        roc_auc_per_class = []
-        for i in range(config.NUM_CLASSES):
-            y_true_binary = (np.array(y_true) == i).astype(int)
-            y_score = np.array(y_probs)[:, i]
-            if len(np.unique(y_true_binary)) > 1:
-                auc = roc_auc_score(y_true_binary, y_score)
-                roc_auc_per_class.append(auc)
-            else:
-                roc_auc_per_class.append(np.nan)
-        
-        roc_auc_macro = np.nanmean(roc_auc_per_class)
-    except:
-        roc_auc_per_class = [np.nan] * config.NUM_CLASSES
-        roc_auc_macro = np.nan
-    
     return {
-        'f1_per_class': f1_per_class,
-        'f1_macro': f1_macro,
-        'f1_weighted': f1_weighted,
-        'roc_auc_per_class': roc_auc_per_class,
-        'roc_auc_macro': roc_auc_macro
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'confusion_matrix': cm,
+        'predictions': all_preds,
+        'labels': all_labels,
+        'probabilities': all_probs
     }
-
 
 def plot_training_history(history, save_path):
-    """Plot and save training history"""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    """Training curves"""
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))  # FIXED: subplots not subplts
     
     # Loss
-    axes[0, 0].plot(history['train_loss'], label='Train Loss')
-    axes[0, 0].plot(history['val_loss'], label='Val Loss')
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].set_title('Training and Validation Loss')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
+    axes[0].plot(history['train_loss'], label='Train Loss')
+    axes[0].plot(history['val_loss'], label='Val Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training and Validation Loss')
+    axes[0].legend()
+    axes[0].grid(True)
     
     # Accuracy
-    axes[0, 1].plot(history['train_acc'], label='Train Acc')
-    axes[0, 1].plot(history['val_acc'], label='Val Acc')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].set_ylabel('Accuracy')
-    axes[0, 1].set_title('Training and Validation Accuracy')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    # F1 Score
-    axes[1, 0].plot(history['val_f1_macro'], label='Macro F1')
-    axes[1, 0].plot(history['val_f1_weighted'], label='Weighted F1')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('F1 Score')
-    axes[1, 0].set_title('Validation F1 Scores')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
-    
-    # ROC-AUC
-    axes[1, 1].plot(history['val_roc_auc'], label='ROC-AUC')
-    axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('ROC-AUC')
-    axes[1, 1].set_title('Validation ROC-AUC')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True)
-    
+    axes[1].plot(history['train_acc'], label='Train Acc')
+    axes[1].plot(history['val_acc'], label='Val Acc')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Accuracy')
+    axes[1].set_title('Training and Validation Accuracy')
+    axes[1].legend()
+    axes[1].grid(True)
+
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\nTraining history saved to {save_path}")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
 
+def plot_confusion_matrix(cm, save_path):
+    'plt confusion matrix'
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=['Benign', 'Melanoma'],
+               yticklabels=['Benign','Melanoma'])
+    plt.ylabel('True Label')
+    plt.xlabel('Prdicted Label')
+    plt.title('Congusion Matrix')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
 
-def main():
-    print("="*80)
-    print("HAM10000 Skin Cancer Classification with EfficientNet")
-    print("="*80)
-    
-    # Load and preprocess metadata
-    print("\n1. Loading metadata...")
-    df = load_and_preprocess_metadata(config.METADATA_PATH)
-    
-    # Patient-based split (prevents data leakage)
-    print("\n2. Performing patient-based stratified split...")
-    train_df, val_df, test_df = patient_based_split(
-        df, 
-        test_size=config.TEST_SIZE,
-        val_size=config.VAL_SIZE
+def plot_roc_curve(labels, probs, save_path):
+    """
+    Plot and save the ROC curve.
+
+    Args:
+        labels: Ground truth binary labels (0 or 1).
+        probs: Predicted probabilities for the positive class.
+        save_path: Path to save the ROC curve image.
+    """
+    # Get false positive rate, true positive rate, and thresholds
+    fpr, tpr, _ = roc_curve(labels, probs)
+    roc_auc = auc(fpr, tpr)
+
+    # Create the plot
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2,
+             label=f'ROC curve (AUC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # Save and close the plot
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+def main(use_ham10000=True, use_isic=False):
+    'Main training pipeline'
+    config = Config()
+    # Create output directories
+    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    print('=' * 70)
+    print("MELANOMA CLASSIFICATION - TRAINING PIPELINE")
+    print('=' * 70)
+    print(f"Device: {config.DEVICE}")
+    print(f"Model: {config.MODEL_NAME}")
+    print(f"Image size: {config.IMG_SIZE}")
+    print(f"Batch size: {config.BATCH_SIZE}")
+    print(f"Learning rate: {config.LEARNING_RATE}")
+    print("=" * 70)
+    # Load data
+    if use_ham10000:
+        df = load_ham10000_data(config.HAM10000_BASE)
+    elif use_isic:
+        df = load_isic_data(config.ISIC_BASE)
+        # Filter to train split for now
+        df = df[df['split'] == 'train'].reset_index(drop=True)
+    else:
+        raise ValueError("Must sepcify eiter HAM10000 or ISIC dataset")
+    #split data
+    print("\nSplitting dataset...")
+    train_df, temp_df = train_test_split(
+        df, test_size = config.TEST_SIZE + config.VAL_SIZE,
+        random_state = config.RANDOM_STATE, stratify=df['binary_label']
     )
-    
-    # Fill missing values (using only training statistics)
-    print("\n3. Filling missing values...")
-    train_df, val_df, test_df = fill_missing_values(train_df, val_df, test_df)
-    
-    # Encode features
-    print("\n4. Encoding categorical features...")
-    train_df, val_df, test_df, num_locations = encode_categorical_features(
-        train_df, val_df, test_df
+    val_df, test_df = train_test_split(
+        temp_df, test_size = config.TEST_SIZE / (config.TEST_SIZE + config.VAL_SIZE),
+        random_state = config.RANDOM_STATE, stratify=temp_df['binary_label']
     )
-    
+    print(f"Train: {len(train_df)} | val: {len(val_df)}| Test: {len(test_df)}")
+
     # Create datasets
-    print("\n5. Creating datasets...")
-    train_dataset = HAM10000Dataset(
-        train_df, 
-        config.IMAGE_DIR, 
-        transform=get_transforms(is_training=True)
-    )
-    val_dataset = HAM10000Dataset(
-        val_df, 
-        config.IMAGE_DIR, 
-        transform=get_transforms(is_training=False)
-    )
-    test_dataset = HAM10000Dataset(
-        test_df, 
-        config.IMAGE_DIR, 
-        transform=get_transforms(is_training=False)
-    )
+    train_dataset = MelanomaDataset(train_df, get_train_transform(config.IMG_SIZE))
+    val_dataset = MelanomaDataset(val_df, get_val_transform(config.IMG_SIZE))
+    test_dataset = MelanomaDataset(test_df, get_val_transform(config.IMG_SIZE))
     
     # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=4
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config.BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=4
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=config.BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=4
-    )
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, 
+                             shuffle=True, num_workers=config.NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, 
+                           shuffle=False, num_workers=config.NUM_WORKERS)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, 
+                            shuffle=False, num_workers=config.NUM_WORKERS)
     
-    print(f"Train batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
-    print(f"Test batches: {len(test_loader)}")
+    # Calculate class weights for imbalanced data
+    class_counts = train_df['binary_label'].value_counts()
+    total = len(train_df)
+    class_weights = {0: total/(2*class_counts[0]), 1: total/(2*class_counts[1])}
+    weights = torch.FloatTensor([class_weights[0], class_weights[1]]).to(config.DEVICE)
+    
+    print(f"\nClass weights: {class_weights}")
     
     # Create model
-    print(f"\n6. Creating {config.MODEL_NAME} model...")
-    model = EfficientNetClassifier(
-        model_name=config.MODEL_NAME,
-        num_classes=config.NUM_CLASSES,
-        num_metadata_features=3,  # age, sex, localization
-        pretrained=True
-    )
-    
-    # Freeze backbone layers
-    if config.FREEZE_LAYERS:
-        print("\n7. Freezing backbone layers...")
-        model.freeze_backbone(unfreeze_last_n=config.UNFREEZE_LAST_N)
-    
+    print(f"\nCreating {config.MODEL_NAME} model...")
+    model = MelanomaClassifier(config.MODEL_NAME, config.NUM_CLASSES, config.PRETRAINED)
     model = model.to(config.DEVICE)
     
-    # Class-weighted loss
-    print("\n8. Calculating class weights...")
-    class_weights = calculate_class_weights(train_df).to(config.DEVICE)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    
-    # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY
-    )
-    
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5, 
-        patience=3,
-    )
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE, 
+                          weight_decay=config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
+                                                     factor=0.5, patience=5)
     
     # Training loop
-    print("\n9. Starting training...")
-    print("="*80)
+    print("\nStarting training...")
+    print("=" * 70)
     
-    best_val_loss = float('inf')
     history = {
-        'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': [],
-        'val_f1_macro': [], 'val_f1_weighted': [],
-        'val_roc_auc': []
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': []
     }
     
-    for epoch in range(config.EPOCHS):
-        print(f"\nEpoch {epoch+1}/{config.EPOCHS}")
-        print("-" * 40)
+    best_val_acc = 0.0
+    patience_counter = 0
+    
+    for epoch in range(config.NUM_EPOCHS):
+        print(f"\nEpoch {epoch+1}/{config.NUM_EPOCHS}")
+        print("-" * 70)
         
         # Train
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, config.DEVICE
-        )
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, 
+                                           optimizer, config.DEVICE)
         
         # Validate
-        val_loss, val_acc, val_preds, val_labels, val_probs = validate(
-            model, val_loader, criterion, config.DEVICE
-        )
+        val_loss, val_acc = validate(model, val_loader, criterion, config.DEVICE)
         
-        # Calculate metrics
-        metrics = calculate_metrics(val_labels, val_preds, val_probs)
+        # Update scheduler
+        scheduler.step(val_loss)
         
-        # Update history
+        # Store history
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
-        history['val_f1_macro'].append(metrics['f1_macro'])
-        history['val_f1_weighted'].append(metrics['f1_weighted'])
-        history['val_roc_auc'].append(metrics['roc_auc_macro'])
         
-        # Print metrics
-        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"\nTrain Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-        print(f"Val F1 (Macro): {metrics['f1_macro']:.4f} | Val F1 (Weighted): {metrics['f1_weighted']:.4f}")
-        print(f"Val ROC-AUC: {metrics['roc_auc_macro']:.4f}")
-        
-        # Learning rate scheduler
-        scheduler.step(val_loss)
+        print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
                 'val_acc': val_acc,
-                'history': history
-            }, config.MODEL_SAVE_PATH)
-            print(f"✓ Model saved! (Val Loss: {val_loss:.4f})")
+                'val_loss': val_loss,
+            }, os.path.join(config.CHECKPOINT_DIR, 'best_model.pth'))
+            print(f"✓ Best model saved! Val Acc: {val_acc:.4f}")
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            print(f"\nEarly stopping at epoch {epoch+1}")
+            break
     
     # Plot training history
-    print("\n10. Plotting training history...")
-    plot_training_history(history, config.HISTORY_SAVE_PATH)
+    plot_training_history(history, os.path.join(config.RESULTS_DIR, 'training_history.png'))
     
-    # Load best model for final evaluation
-    print("\n11. Loading best model for final evaluation...")
-    checkpoint = torch.load(config.MODEL_SAVE_PATH)
+    # Load best model and evaluate
+    print("\n" + "=" * 70)
+    print("EVALUATING BEST MODEL ON TEST SET")
+    print("=" * 70)
+    
+    checkpoint = torch.load(os.path.join(config.CHECKPOINT_DIR, 'best_model.pth'))
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Final test evaluation
-    print("\n12. Final Test Set Evaluation")
-    print("="*80)
-    test_loss, test_acc, test_preds, test_labels, test_probs = validate(
-        model, test_loader, criterion, config.DEVICE
-    )
-    test_metrics = calculate_metrics(test_labels, test_preds, test_probs)
+    metrics = evaluate_model(model, test_loader, config.DEVICE)
     
-    print(f"\nTest Accuracy: {test_acc:.4f}")
-    print(f"Test F1 (Macro): {test_metrics['f1_macro']:.4f}")
-    print(f"Test F1 (Weighted): {test_metrics['f1_weighted']:.4f}")
-    print(f"Test ROC-AUC: {test_metrics['roc_auc_macro']:.4f}")
+    print(f"\nTest Results:")
+    print(f"Accuracy:  {metrics['accuracy']:.4f}")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall:    {metrics['recall']:.4f}")
+    print(f"F1 Score:  {metrics['f1']:.4f}")
+    print(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
+    print(f"\nConfusion Matrix:")
+    print(metrics['confusion_matrix'])
     
-    print("\nPer-class F1 Scores:")
-    for i, name in enumerate(DX_NAMES):
-        print(f"  {name}: {test_metrics['f1_per_class'][i]:.4f}")
+    # Plot results
+    plot_confusion_matrix(metrics['confusion_matrix'], 
+                         os.path.join(config.RESULTS_DIR, 'confusion_matrix.png'))
+    plot_roc_curve(metrics['labels'], metrics['probabilities'],
+                  os.path.join(config.RESULTS_DIR, 'roc_curve.png'))
     
-    print("\nPer-class ROC-AUC:")
-    for i, name in enumerate(DX_NAMES):
-        print(f"  {name}: {test_metrics['roc_auc_per_class'][i]:.4f}")
+    print(f"\nResults saved to: {config.RESULTS_DIR}")
+    print("Training complete!")
     
-    # Classification report
-    print("\nDetailed Classification Report:")
-    print(classification_report(test_labels, test_preds, target_names=DX_NAMES))
-    
-    print("\n" + "="*80)
-    print("Training Complete!")
-    print(f"Best model saved to: {config.MODEL_SAVE_PATH}")
-    print(f"Training history saved to: {config.HISTORY_SAVE_PATH}")
-    print("="*80)
-
+    return model, metrics, history
 
 if __name__ == "__main__":
-    main()
+    # Run training
+    model, metrics, history = main(use_ham10000=True, use_isic=True)
