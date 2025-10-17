@@ -29,3 +29,11 @@ Building the model (hardest part)
 4) add metadata info
 5) make models easily switchable. For example can test in one line of code with resnet 50, efficient net, resnet 16
 6) go to "making the project better"
+
+
+
+Most common types of skin cancer
+1) melanoma. Most important though
+2) basal-cell carcinoma
+3) squamous cell carcinoma (not in the dataset). Comes from actinic keratosis
+
