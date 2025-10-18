@@ -60,6 +60,16 @@ class Config:
     WEIGHT_DECAY = 1e-4
     EARLY_STOPPING_PATIENCE = 30
 
+    # Warmup / fine-tune
+    FREEZE_EPOCHS = 3            # 2–3 as you like
+    HEAD_LR_WARMUP = 1e-3        # head-only phase
+    HEAD_LR_FINETUNE = 1e-4      # during full fine-tune
+
+    # Discriminative LRs for backbone (lower -> earlier layers)
+    BACKBONE_LR_LOW = 1e-5
+    BACKBONE_LR_MID = 2e-5
+    BACKBONE_LR_HIGH = 3e-5
+
     #Dataset split ratio and seeding
     TEST_SIZE = 0.30
     VAL_SIZE = 0.20
@@ -197,6 +207,87 @@ class MelanomaClassifier(nn.Module):
         features = self.backbone(x)
         output = self.classifier(features)
         return output, features
+
+def set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
+    """Freeze or unfreeze backbone params in place."""
+    for p in model.backbone.parameters():
+        p.requires_grad = trainable
+
+def get_param_groups_discriminative(model: nn.Module, config: Config):
+    """
+    Build parameter groups with discriminative LRs for supported backbones.
+    Head gets HEAD_LR_FINETUNE, backbone gets tiered 1e-5..3e-5.
+    """
+    param_groups = []
+
+    # 1) Classifier / head
+    param_groups.append({
+        "params": list(model.classifier.parameters()),
+        "lr": config.HEAD_LR_FINETUNE,
+        "weight_decay": config.WEIGHT_DECAY
+    })
+
+    # 2) Backbone tiers
+    bb = model.backbone
+    low = config.BACKBONE_LR_LOW
+    mid = config.BACKBONE_LR_MID
+    high = config.BACKBONE_LR_HIGH
+
+    if isinstance(bb, models.ResNet):
+        # Early layers: tiny LR
+        tiers = [
+            (["conv1", "bn1"], low),
+            (["layer1"], low),
+            (["layer2"], mid),
+            (["layer3"], high),
+            (["layer4"], high),
+        ]
+        for names, lr in tiers:
+            params = []
+            for n in names:
+                m = getattr(bb, n)
+                params += list(m.parameters())
+            param_groups.append({"params": params, "lr": lr, "weight_decay": config.WEIGHT_DECAY})
+
+    elif hasattr(bb, "features"):  # EfficientNet-style
+        # Rough split of stages from shallow to deep
+        feat = bb.features
+        n = len(feat)
+        cut1 = max(1, n // 3)
+        cut2 = max(cut1 + 1, (2 * n) // 3)
+
+        early = list(feat[:cut1].parameters())             # low
+        middle = list(feat[cut1:cut2].parameters())        # mid
+        late = list(feat[cut2:].parameters())              # high
+
+        param_groups += [
+            {"params": early,  "lr": low,  "weight_decay": config.WEIGHT_DECAY},
+            {"params": middle, "lr": mid,  "weight_decay": config.WEIGHT_DECAY},
+            {"params": late,   "lr": high, "weight_decay": config.WEIGHT_DECAY},
+        ]
+    else:
+        # Fallback: if we can’t tier, at least give the whole backbone a sane small LR
+        param_groups.append({
+            "params": [p for p in model.backbone.parameters() if p.requires_grad],
+            "lr": mid, "weight_decay": config.WEIGHT_DECAY
+        })
+
+    return param_groups
+
+def build_optimizer_warmup(model: nn.Module, config: Config):
+    """
+    AdamW on the head only, LR = 1e-3. Backbone is expected to be frozen.
+    """
+    head_params = [p for p in model.classifier.parameters() if p.requires_grad]
+    return optim.AdamW(head_params, lr=config.HEAD_LR_WARMUP, weight_decay=config.WEIGHT_DECAY)
+
+def build_optimizer_finetune(model: nn.Module, config: Config):
+    """
+    AdamW with discriminative LRs across backbone tiers + head.
+    """
+    groups = get_param_groups_discriminative(model, config)
+    return optim.AdamW(groups)  # each group already sets its own lr/wd
+
 
 # Bigger gamma to focus more on hard examples
 # Bigger alpha to balance classes
@@ -495,10 +586,13 @@ def main(use_ham10000=True, use_isic=False):
     # Loss and optimizer
     # criterion = nn.CrossEntropyLoss(weight=weights) # This is bad with imbalanced data
     criterion = FocalLoss(alpha=weights, gamma=2.0)
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE, 
-                          weight_decay=config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
-                                                     factor=0.5, patience=5)
+    
+    # Phase 1: freeze backbone, head-only AdamW @ 1e-3
+    set_backbone_trainable(model, trainable=False)
+    optimizer = build_optimizer_warmup(model, config)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+    current_phase = "warmup"
     
     # Training loop
     print("\nStarting training...")
@@ -518,6 +612,15 @@ def main(use_ham10000=True, use_isic=False):
     for epoch in range(config.NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{config.NUM_EPOCHS}")
         print("-" * 70)
+        
+        # Switch from warmup to fine-tune after FREEZE_EPOCHS
+        if current_phase == "warmup" and epoch == config.FREEZE_EPOCHS:
+            print("\nUnfreezing backbone and switching to discriminative LRs...")
+            set_backbone_trainable(model, trainable=True)
+            optimizer = build_optimizer_finetune(model, config)  # AdamW with param groups
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+            current_phase = "finetune"
+
         
         # Train
         train_loss, train_acc = train_epoch(model, train_loader, criterion, 
