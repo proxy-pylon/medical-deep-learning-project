@@ -9,3 +9,5 @@ To solve class imbalance:
 2. Adjust class weights. Double or triple it
 3. Oversample the minority class
 4. Use binary focal loss instead of cross-entropy loss
+
+ideas: You can adjust threshold to get +0.10 or +0.15 for F1. I will not do so for now
