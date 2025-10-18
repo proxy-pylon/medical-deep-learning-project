@@ -10,4 +10,7 @@ To solve class imbalance:
 3. Oversample the minority class
 4. Use binary focal loss instead of cross-entropy loss
 
-ideas: You can adjust threshold to get +0.10 or +0.15 for F1. I will not do so for now
+Next steps:
+Document the code. Add comments, rewrite imports, specify inputs and outputs of functions, add docstrings
+Save version across laptop, server, and github
+Write basic report
