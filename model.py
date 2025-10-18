@@ -150,23 +150,38 @@ class MelanomaDataset(Dataset):
         }
 
 def get_train_transform(img_size=224):
-    """Augmenting images"""
     return A.Compose([
-        A.Resize(img_size, img_size),
+        A.RandomResizedCrop(
+                size=(img_size, img_size),
+                scale=(0.90, 1.00),
+                ratio=(0.9, 1.1),
+                p=1.0
+            ),
         A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=45, p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),  # FIXED: val_shift_limit
+        A.Rotate(limit=20, border_mode=cv2.BORDER_REFLECT_101, p=0.7),
+        # Small center-ish crop to shave off potential reflected slivers
+        A.CenterCrop(height=img_size, width=img_size, p=1.0),
+
+        A.Affine(scale=(0.95, 1.05), translate_percent=(-0.02, 0.02),
+                 shear=(-5, 5), mode=cv2.BORDER_REFLECT_101, p=0.5),
+
+        A.RandomBrightnessContrast(0.10, 0.10, p=0.3),
+        A.ColorJitter(0.05, 0.05, 0.05, 0.02, p=0.2),
+        A.CLAHE(clip_limit=(1, 2), tile_grid_size=(8, 8), p=0.2),
+
         A.OneOf([
             A.GaussNoise(var_limit=(10.0, 50.0)),
             A.GaussianBlur(blur_limit=(3, 7)),
             A.MedianBlur(blur_limit=5),
         ], p=0.3),
+        A.CoarseDropout(max_holes=1, min_holes=1,
+                        max_height=int(0.08*img_size), max_width=int(0.08*img_size),
+                        min_height=8, min_width=8, fill_value=0, p=0.15),
+
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
+
 
 def get_val_transform(img_size=224):
     """Validation/test augmentation pipeline"""
