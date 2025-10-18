@@ -31,6 +31,10 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -194,6 +198,29 @@ class MelanomaClassifier(nn.Module):
         output = self.classifier(features)
         return output, features
 
+# Bigger gamma to focus more on hard examples
+# Bigger alpha to balance classes
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha  # tensor of shape [num_classes] or scalar
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Cross entropy per sample
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        # Get predicted probabilities for the correct class
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 def train_epoch(model, loader, criterion, optimizer, device):
     """Train for one epoch"""
     model.train()
@@ -226,43 +253,70 @@ def train_epoch(model, loader, criterion, optimizer, device):
     # FIXED: Return statement moved outside the loop
     return running_loss / total, correct / total
 
+# def validate(model, loader, criterion, device):
+#     """
+#     Validate the model on the given data loader.
+
+#     Args:
+#         model: The neural network model.
+#         loader: DataLoader for the validation dataset.
+#         criterion: Loss function.
+#         device: Device to run the model on (e.g., 'cuda' or 'cpu').
+
+#     Returns:
+#         Tuple containing average loss and accuracy.
+#     """
+#     model.eval()
+#     running_loss = 0.0
+#     correct = 0
+#     total = 0
+
+#     with torch.no_grad():
+#         for batch in tqdm(loader, desc='Validation'):
+#             images = batch['image'].to(device)
+#             labels = batch['label'].to(device)
+
+#             outputs, _ = model(images)
+#             loss = criterion(outputs, labels)
+
+#             running_loss += loss.item() * images.size(0)
+
+#             # Fix: correctly unpack the max output
+#             _, predicted = outputs.max(1)
+
+#             total += labels.size(0)
+#             correct += predicted.eq(labels).sum().item()
+
+#     avg_loss = running_loss / total
+#     accuracy = correct / total
+#     return avg_loss, accuracy
+
+from sklearn.metrics import f1_score
+
+# Validation function with F1 score instead of accuracy
 def validate(model, loader, criterion, device):
-    """
-    Validate the model on the given data loader.
-
-    Args:
-        model: The neural network model.
-        loader: DataLoader for the validation dataset.
-        criterion: Loss function.
-        device: Device to run the model on (e.g., 'cuda' or 'cpu').
-
-    Returns:
-        Tuple containing average loss and accuracy.
-    """
     model.eval()
     running_loss = 0.0
-    correct = 0
-    total = 0
+    all_labels = []
+    all_preds = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Validation'):
             images = batch['image'].to(device)
             labels = batch['label'].to(device)
-
             outputs, _ = model(images)
             loss = criterion(outputs, labels)
-
             running_loss += loss.item() * images.size(0)
 
-            # Fix: correctly unpack the max output
             _, predicted = outputs.max(1)
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
 
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+    avg_loss = running_loss / len(loader.dataset)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    accuracy = (np.array(all_preds) == np.array(all_labels)).mean()
+    return avg_loss, accuracy, f1
 
-    avg_loss = running_loss / total
-    accuracy = correct / total
-    return avg_loss, accuracy
 
 def evaluate_model(model, loader, device):
     """Testing"""
@@ -425,7 +479,10 @@ def main(use_ham10000=True, use_isic=False):
     # Calculate class weights for imbalanced data
     class_counts = train_df['binary_label'].value_counts()
     total = len(train_df)
-    class_weights = {0: total/(2*class_counts[0]), 1: total/(2*class_counts[1])}
+    class_weights = {
+        0: total/(2*class_counts[0]), 
+        1: total/(2*class_counts[1]) * 1 # multiply by some scalar to give more weight to melanoma
+    }
     weights = torch.FloatTensor([class_weights[0], class_weights[1]]).to(config.DEVICE)
     
     print(f"\nClass weights: {class_weights}")
@@ -436,7 +493,8 @@ def main(use_ham10000=True, use_isic=False):
     model = model.to(config.DEVICE)
     
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    # criterion = nn.CrossEntropyLoss(weight=weights) # This is bad with imbalanced data
+    criterion = FocalLoss(alpha=weights, gamma=2.0)
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE, 
                           weight_decay=config.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
@@ -454,6 +512,7 @@ def main(use_ham10000=True, use_isic=False):
     }
     
     best_val_acc = 0.0
+    best_val_f1 = 0.0
     patience_counter = 0
     
     for epoch in range(config.NUM_EPOCHS):
@@ -465,7 +524,7 @@ def main(use_ham10000=True, use_isic=False):
                                            optimizer, config.DEVICE)
         
         # Validate
-        val_loss, val_acc = validate(model, val_loader, criterion, config.DEVICE)
+        val_loss, val_acc, val_f1 = validate(model, val_loader, criterion, config.DEVICE)
         
         # Update scheduler
         scheduler.step(val_loss)
@@ -481,17 +540,30 @@ def main(use_ham10000=True, use_isic=False):
         print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            patience_counter = 0
+        # if val_acc > best_val_acc:
+        #     best_val_acc = val_acc
+        #     patience_counter = 0
+        #     torch.save({
+        #         'epoch': epoch,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'val_acc': val_acc,
+        #         'val_loss': val_loss,
+        #     }, os.path.join(config.CHECKPOINT_DIR, 'best_model.pth'))
+        #     print(f"✓ Best model saved! Val Acc: {val_acc:.4f}")
+        # else:
+        #     patience_counter += 1
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
+                'val_f1': val_f1,
                 'val_loss': val_loss,
             }, os.path.join(config.CHECKPOINT_DIR, 'best_model.pth'))
-            print(f"✓ Best model saved! Val Acc: {val_acc:.4f}")
+            print(f"✓ Best model saved! Val F1: {val_f1:.4f}")
         else:
             patience_counter += 1
         
