@@ -1,8 +1,10 @@
+#Lazzat did the change
+
 # Standard library
 import os
 import sys
 import warnings
-from pathlib import Path
+from pathlib import Patр
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Third-party libraries
@@ -1305,4 +1307,5 @@ def main(use_ham10000: bool = True, use_isic: bool = False) -> Tuple[nn.Module, 
 if __name__ == "__main__":
     # Run training
     model, metrics, history = main(use_ham10000=True, use_isic=True)
+
 
