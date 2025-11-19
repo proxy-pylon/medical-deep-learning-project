@@ -1,0 +1,5 @@
+.venv/
+venv/
+output/
+__pycache__/
+data/archive/
