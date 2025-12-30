@@ -1,213 +1,210 @@
-Here’s a clean, drop-in `README.md` you can use. It stays in-bounds: Linux setup, venv or Docker, installing `requirements.txt`, and pulling data from Kaggle. No phantom Makefiles or other imaginary friends.
+Ребята почитайте это. Как запускать, пользоваться и тд
 
-```markdown
-# Final Project
+# Melanoma Classifier - Unified Codebase Summary
 
-Reproducible setup for training and evaluation. This document covers:
+## What Was Done
 
-- Creating a Python virtual environment **or** using Docker on Linux
-- Installing dependencies from `requirements.txt`
-- Downloading data from Kaggle using the Kaggle API
-- Project layout and expected data paths
+### 1. Removed Components
+- ✅ Temperature Scaling (TemperatureScaler class)
+- ✅ Calibration functions (fit_temperature)
+- ✅ ECE (Expected Calibration Error)
+- ✅ Brier Score
+- ✅ Reliability diagrams
+- ✅ All calibration-related code
 
----
+### 2. Added Components
+- ✅ ConvNeXt model support (integrated into base_model.py)
+- ✅ GradCAM implementation for interpretability
+- ✅ GradCAM visualization script
 
-## Project layout
+### 3. Unified Structure
+- ✅ Separated concerns into modules: config, data, models, training, evaluation, interpretability
+- ✅ Removed all notebook code
+- ✅ Created clean Python scripts
+- ✅ Removed all comments from code
+
+## File Structure
 
 ```
-
-final-project/
-├─ data/            # put raw/processed datasets here
-├─ output/          # training logs, checkpoints, predictions
-├─ report/          # notebooks, figures, write-ups
-├─ check_gpu.py
-├─ model.py
-├─ requirements.txt
-└─ README.md
-
-````
-
-> If you’re on WSL, the project path may look like `\\wsl.localhost\Ubuntu-24.04\home\<user>\...`.
-
----
-
-## Option A: Python virtual environment (recommended)
-
-### 1) Prerequisites
-- Python 3.10+ installed (`python3 --version`)
-- `pip` and `venv` modules available
-
-On Ubuntu/Debian:
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-````
-
-### 2) Create and activate the venv
-
-From the project root:
-
-```bash
-python3 -m venv .venv
-# Activate for current shell
-source .venv/bin/activate
-# Upgrade packaging tools inside the venv
-python -m pip install --upgrade pip setuptools wheel
+melanoma-classifier/
+│
+├── config/
+│   └── config.py                 # All configuration settings
+│
+├── data/
+│   ├── __init__.py
+│   ├── dataset.py                # MelanomaDataset class
+│   └── data_loader.py            # load_ham10000_data function
+│
+├── models/
+│   ├── __init__.py
+│   ├── base_model.py             # MelanomaClassifier (supports all models)
+│   ├── senet.py                  # SENet implementation
+│   └── losses.py                 # FocalLoss
+│
+├── training/
+│   ├── __init__.py
+│   ├── trainer.py                # Training loop, optimizers
+│   └── augmentation.py           # Albumentations transforms
+│
+├── evaluation/
+│   ├── __init__.py
+│   ├── metrics.py                # Evaluation metrics (no calibration)
+│   └── visualization.py          # Plotting functions
+│
+├── interpretability/
+│   ├── __init__.py
+│   └── gradcam.py                # GradCAM implementation
+│
+├── utils/
+│   └── __init__.py
+│
+├── train.py                      # Main training script
+├── evaluate.py                   # Evaluation script
+├── visualize_gradcam.py          # GradCAM visualization script
+├── requirements.txt              # Dependencies
+└── README.md                     # Documentation
 ```
 
-> Each new terminal session: run `source .venv/bin/activate` before working.
+## Supported Models
 
-### 3) Install dependencies
+1. **ResNet50** - Set `MODEL_NAME = 'resnet50'` in config
+2. **SENet** - Set `MODEL_NAME = 'senet'` in config
+3. **EfficientNet** - Set `MODEL_NAME = 'efficientnet'` in config
+4. **ConvNeXt** - Set `MODEL_NAME = 'convnext'` in config (NEW)
+5. **VGG16** - Set `MODEL_NAME = 'vgg16'` in config
 
-```bash
-pip install -r requirements.txt
-```
+## Key Features
 
----
+### Training Features
+- Focal Loss for class imbalance
+- Discriminative learning rates (different LRs for different layers)
+- Warmup phase (head-only training first)
+- Fine-tuning phase (full model training)
+- Early stopping
+- Learning rate scheduling
 
-## Option B: Docker (no local Python needed)
+### Evaluation Metrics (Simplified)
+- Accuracy
+- Precision
+- Recall
+- F1 Score
+- ROC-AUC
+- Confusion Matrix
+- Precision-Recall Curve
 
-### 1) Install Docker
+### Interpretability (NEW)
+- GradCAM heatmaps
+- Visual explanations of model predictions
+- Works with all model architectures
 
-Follow your distro instructions. On Ubuntu:
+## Usage Examples
 
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo $VERSION_CODENAME) stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-```
-
-Add your user to the `docker` group (optional):
-
-```bash
-sudo usermod -aG docker "$USER"
-# Log out and back in for this to take effect
-```
-
-### 2) Run a container and install deps inside it
-
-From the project root:
-
-```bash
-docker run --rm -it \
-  -v "$PWD":/work \
-  -w /work \
-  python:3.11-slim bash
-```
-
-Inside the container shell:
+### 1. Train a Model
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
+# Default (ResNet50)
+python train.py
+
+# For other models, edit config/config.py:
+# MODEL_NAME = 'senet'  # or 'convnext', 'efficientnet', 'vgg16'
 ```
 
-> To use a GPU, launch an image that includes CUDA and run with `--gpus all` if your host supports it.
-
----
-
-## Downloading data from Kaggle
-
-We use the Kaggle API to fetch datasets directly into `data/`.
-
-### 1) Install the Kaggle CLI
-
-If you’re using the venv:
+### 2. Evaluate a Model
 
 ```bash
-pip install kaggle
+# With automatic threshold finding
+python evaluate.py --checkpoint output/checkpoints/best_model.pth --model resnet50
+
+# With custom threshold
+python evaluate.py --checkpoint output/checkpoints/best_model.pth --model resnet50 --threshold 0.6
 ```
 
-In Docker: run the same command inside the container.
+### 3. Generate GradCAM Visualizations
 
-### 2) Set up your Kaggle credentials
+```bash
+# Generate 20 visualizations from test set
+python visualize_gradcam.py \
+    --checkpoint output/checkpoints/best_model.pth \
+    --model resnet50 \
+    --num_samples 20 \
+    --split test
 
-1. Go to [https://www.kaggle.com](https://www.kaggle.com) → your profile → **Account** → **API** → **Create New Token**.
-   This downloads a file named `kaggle.json`.
-2. Place it at `~/.kaggle/kaggle.json` and set permissions:
-
-   ```bash
-   mkdir -p ~/.kaggle
-   mv /path/to/kaggle.json ~/.kaggle/
-   chmod 600 ~/.kaggle/kaggle.json
-   ```
-
-> On WSL, `~` refers to your Linux home (not Windows). Use your Linux terminal.
-
-### 3) Download a dataset
-
-Replace the placeholder with the actual dataset slug you’re using.
-
-* **Public dataset example** (dataset page shows the slug):
-
-  ```bash
-  kaggle datasets download -d <owner>/<dataset-slug> -p data/ --unzip
-  ```
-
-  Example:
-
-  ```bash
-  kaggle datasets download -d kmader/skin-cancer-mnist-ham10000 -p data/ --unzip
-  ```
-
-* **Competition data** (requires competition rules acceptance in the browser first):
-
-  ```bash
-  kaggle competitions download -c <competition-name> -p data/
-  # Unzip if needed
-  unzip -q data/*.zip -d data/
-  ```
-
-### 4) Verify files
-
-After download and unzip, you should have files under `data/`. Adjust any paths in your scripts if needed.
-
----
-
-## Quick checks
-
-* Verify Python sees the packages:
-
-  ```bash
-  python -c "import torch, pandas, sklearn; print('ok')"
-  ```
-* Optional GPU check:
-
-  ```bash
-  python check_gpu.py
-  ```
-
----
-
-## Notes
-
-* Always activate the venv (or enter the Docker container) before running any training or evaluation scripts.
-* If `pip install -r requirements.txt` fails due to system packages, install build tools:
-
-  ```bash
-  sudo apt-get update
-  sudo apt-get install -y build-essential
-  ```
-* If a specific library needs system headers (e.g., OpenCV, libGL), install them:
-
-  ```bash
-  sudo apt-get install -y libgl1 libglib2.0-0
-  ```
-
----
-
-## Reproducibility
-
-Use fixed seeds in your scripts where applicable and record exact package versions in `requirements.txt`. When updating dependencies, consider pinning versions to avoid surprises.
-
+# Visualize from validation set
+python visualize_gradcam.py \
+    --checkpoint output/checkpoints/best_model.pth \
+    --model convnext \
+    --num_samples 10 \
+    --split val \
+    --output_dir ./output/gradcam_val
 ```
 
-Enjoy responsibly.
-```
+## What Changed from Original Code
+
+### From ResNet Notebook
+- Removed all notebook-specific code
+- Removed calibration/temperature scaling
+- Simplified metrics
+- Kept core training logic
+- Moved to modular structure
+
+### From SENet Notebook
+- Extracted SENet architecture to models/senet.py
+- Integrated into unified training pipeline
+- Removed calibration code
+- Standardized with other models
+
+### From model.py
+- Split into multiple modules
+- Removed temperature scaling
+- Removed calibration metrics (ECE, Brier, reliability)
+- Kept Focal Loss
+- Kept discriminative learning rates
+- Kept augmentation pipeline
+
+## New Additions
+
+### ConvNeXt Support
+- Added to models/base_model.py
+- Uses torchvision's ConvNeXt implementation
+- Supports pretrained weights
+- Compatible with all training features
+
+### GradCAM
+- New interpretability module
+- Generates attention heatmaps
+- Shows what the model "looks at"
+- Helps debug and build trust
+- Works with all architectures
+
+## Benefits of Unified Structure
+
+1. **Easy to extend**: Add new models by editing base_model.py
+2. **Easy to maintain**: Each module has single responsibility
+3. **Easy to test**: Modular components can be tested independently
+4. **Easy to understand**: Clear separation of concerns
+5. **Reusable**: Components can be used in other projects
+6. **No notebooks**: Pure Python for better version control
+
+## Next Steps
+
+1. Place HAM10000 data in `./data/` directory
+2. Edit `config/config.py` to choose model and hyperparameters
+3. Run `python train.py` to train
+4. Run `python evaluate.py` to evaluate
+5. Run `python visualize_gradcam.py` to interpret
+
+## Dependencies
+
+All dependencies are in requirements.txt:
+- numpy
+- pandas
+- torch
+- torchvision
+- Pillow
+- opencv-python
+- tqdm
+- matplotlib
+- seaborn
+- scikit-learn
+- albumentations

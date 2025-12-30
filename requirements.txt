@@ -9,19 +9,3 @@ matplotlib
 seaborn
 scikit-learn
 albumentations
-
-# Windows setup:
-# in cmd: python -m venv .venv
-# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-# ".\.venv\Scripts\Activate.ps1"
-# "source .venv/bin/activate"  # for Linux/Mac
-# pip install -r requirements.txt
-
-# Checking installed packages
-# pip list
-
-# Checking GPU availability
-# python -c "import torch; print(torch.cuda.is_available())"
-
-# Checking nvidia-smi in CMD
-# nvidia-smi
