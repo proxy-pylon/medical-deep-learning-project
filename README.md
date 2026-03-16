@@ -1,6 +1,6 @@
-Ребята почитайте это. Как запускать, пользоваться и тд
+[🇫🇷 Français](./README.fr.md) | [🇬🇧 English](./README.md)
 
-# Melanoma Classifier - Unified Codebase Summary
+# Melanoma Classifier 
 
 ## What Was Done
 
@@ -93,7 +93,7 @@ melanoma-classifier/
 - Confusion Matrix
 - Precision-Recall Curve
 
-### Interpretability (NEW)
+### Interpretability
 - GradCAM heatmaps
 - Visual explanations of model predictions
 - Works with all model architectures
@@ -176,15 +176,6 @@ python visualize_gradcam.py \
 - Shows what the model "looks at"
 - Helps debug and build trust
 - Works with all architectures
-
-## Benefits of Unified Structure
-
-1. **Easy to extend**: Add new models by editing base_model.py
-2. **Easy to maintain**: Each module has single responsibility
-3. **Easy to test**: Modular components can be tested independently
-4. **Easy to understand**: Clear separation of concerns
-5. **Reusable**: Components can be used in other projects
-6. **No notebooks**: Pure Python for better version control
 
 ## Next Steps
 
