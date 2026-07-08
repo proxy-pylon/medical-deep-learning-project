@@ -2,7 +2,7 @@
 
 # Melanoma Classifier 
 
-## What Was Done
+## What Was Completed
 
 ### 1. Removed Components
 - ✅ Temperature Scaling (TemperatureScaler class)
