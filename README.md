@@ -1,5 +1,3 @@
-Ребята почитайте это. Как запускать, пользоваться и тд
-
 # Melanoma Classifier - Unified Codebase Summary
 
 ## What Was Done
